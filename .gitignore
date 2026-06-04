@@ -2,3 +2,6 @@
 *.vscode/
 *sandbox/
 *.cache/
+__pycache__/
+*.pyc
+data/
