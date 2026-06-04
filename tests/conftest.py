@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-import pipeline.cleaner.registry as _reg_module
+from pipeline.cleaner.registry import registry as _registry_singleton
 
 
 # --------------------------------------------------------------------------- #
@@ -12,9 +12,9 @@ import pipeline.cleaner.registry as _reg_module
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def empty_registry(monkeypatch):
-    """Replace the live registry with an empty dict for the duration of a test."""
-    monkeypatch.setattr(_reg_module, "_REGISTRY", {})
-    yield _reg_module._REGISTRY
+    """Swap the registry singleton's internal dict for an empty one for test isolation."""
+    monkeypatch.setattr(_registry_singleton, "_registry", {})
+    yield _registry_singleton._registry
 
 
 # --------------------------------------------------------------------------- #

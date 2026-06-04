@@ -22,17 +22,17 @@ def test_pipeline_module_importable():
 
 
 def test_registry_populated_after_import():
-    """Importing pipeline.cleaner triggers @register on both concrete cleaners."""
-    from pipeline.cleaner import all_cleaners
-    assert {"session_info", "driver_info"} <= set(all_cleaners())
+    """Importing pipeline.cleaner triggers explicit registrations for both concrete cleaners."""
+    from pipeline.cleaner.registry import registry
+    assert {"session_info", "driver_info"} <= set(registry.all())
 
 
 def test_active_cleaners_all_resolvable():
     """Every name in ACTIVE_CLEANERS maps to a registered cleaner class."""
-    from pipeline.cleaner import get_cleaner
+    from pipeline.cleaner.registry import registry
     from pipeline.pipeline import ACTIVE_CLEANERS
     for name in ACTIVE_CLEANERS:
-        cls = get_cleaner(name)
+        cls = registry.get(name)
         assert cls is not None, f"'{name}' is in ACTIVE_CLEANERS but not registered"
 
 

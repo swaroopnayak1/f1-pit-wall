@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+import pipeline.pipeline as pp
 from pipeline.loader.loader import LoadedSession
 from pipeline.pipeline import (
     ACTIVE_CLEANERS,
@@ -40,14 +41,14 @@ class TestRunPipeline:
     def _make_loaded_session(self, year=2023, rnd=1, stype="R"):
         return LoadedSession(year, rnd, stype, MagicMock())
 
-    def test_calls_get_cleaner_for_each_active_cleaner(self, tmp_path):
+    def test_calls_registry_get_for_each_active_cleaner(self, tmp_path):
         mock_cleaner_instance = MagicMock()
         mock_cleaner_cls = MagicMock(return_value=mock_cleaner_instance)
         mock_loader = MagicMock()
         mock_loader.iter_sessions.return_value = [self._make_loaded_session()]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls) as mock_get:
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls) as mock_get:
             run_pipeline([2023], output_root=tmp_path)
 
         assert mock_get.call_count == len(ACTIVE_CLEANERS)
@@ -59,7 +60,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = [loaded]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls):
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls):
             run_pipeline([2023], output_root=tmp_path)
 
         for c in mock_cleaner_cls.call_args_list:
@@ -76,7 +77,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = [self._make_loaded_session()]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls):
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls):
             run_pipeline([2023], output_root=tmp_path)
 
         assert mock_cleaner_instance.run.call_count == len(ACTIVE_CLEANERS)
@@ -88,7 +89,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = [self._make_loaded_session(rnd=7, stype="R")]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls):
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls):
             run_pipeline([2023], output_root=tmp_path)
 
         run_path = mock_cleaner_instance.run.call_args.args[0]
@@ -112,7 +113,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = [self._make_loaded_session()]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls):
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls):
             run_pipeline([2023], output_root=tmp_path)
 
         assert call_counts["run"] == len(ACTIVE_CLEANERS)
@@ -123,7 +124,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = []
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls):
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls):
             run_pipeline([2021, 2022, 2023], output_root=tmp_path)
 
         assert mock_loader.iter_sessions.call_count == 3
@@ -135,7 +136,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = []
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader) as mock_build, \
-             patch("pipeline.pipeline.get_cleaner", return_value=MagicMock(return_value=MagicMock())):
+             patch.object(pp.registry, "get", return_value=MagicMock(return_value=MagicMock())):
             run_pipeline([2023], mode="viz", output_root=tmp_path)
 
         mock_build.assert_called_once_with(mode="viz", offline=False)
@@ -147,7 +148,7 @@ class TestRunPipeline:
         mock_loader.iter_sessions.return_value = [self._make_loaded_session()]
 
         with patch("pipeline.pipeline.build_loader", return_value=mock_loader), \
-             patch("pipeline.pipeline.get_cleaner", return_value=mock_cleaner_cls) as mock_get:
+             patch.object(pp.registry, "get", return_value=mock_cleaner_cls) as mock_get:
             run_pipeline([2023], active=["session_info"], output_root=tmp_path)
 
         assert mock_get.call_count == 1
