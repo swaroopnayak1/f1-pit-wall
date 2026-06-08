@@ -52,7 +52,7 @@ class TestSessionInfoClean:
 
     def test_partition_key_dtypes(self, session_info_session):
         df = SessionInfoCleaner(session_info_session, 2023, 1, "R").clean()
-        assert df["year"].dtype == "int16"
+        assert df["year"].dtype == "int32"
         assert df["round_number"].dtype == "int8"
 
     def test_start_end_date_are_datetime(self, session_info_session):

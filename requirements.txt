@@ -2,5 +2,6 @@ fastf1
 matplotlib
 numpy
 pandas
+seaborn
 pyarrow
 pytest

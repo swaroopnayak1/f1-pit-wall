@@ -1,7 +1,9 @@
 *.csv
-*.vscode/
-*sandbox/
-*.cache/
+.vscode/
+sandbox/
+.cache/
 __pycache__/
 *.pyc
 data/
+.claude/
+.pytest_cache/

@@ -48,7 +48,7 @@ class BaseCleaner(ABC):
 
     def _inject_partition_keys(self, df: pd.DataFrame) -> pd.DataFrame:
         """Attach year, round_number, session_type to any DataFrame."""
-        df["year"]         = pd.array([self.year]         * len(df), dtype="int16")
+        df["year"]         = pd.array([self.year]         * len(df), dtype="int32")
         df["round_number"] = pd.array([self.round_number] * len(df), dtype="int8")
         df["session_type"] = self.session_type
         return df
