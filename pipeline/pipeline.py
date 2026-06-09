@@ -25,7 +25,7 @@ from .loader import build_loader, parse_years
 from .loader.strategies import LoadStrategy
 
 # Cleaners (by registry name) the pipeline runs for each session, in order.
-ACTIVE_CLEANERS: list[str] = ["session_info", "driver_info"]
+ACTIVE_CLEANERS: list[str] = ["session_info", "driver_info", "session_results", "laps", "weather"]
 
 # Default output root for the Parquet dataset (pipeline/../data).
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"

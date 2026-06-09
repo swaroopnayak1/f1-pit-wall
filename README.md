@@ -56,20 +56,30 @@ data/
 └── year=2024/
     └── round=01/
         └── session=R/
+            ├── session_info.parquet
             ├── driver_info.parquet
-            └── session_info.parquet
+            ├── session_results.parquet
+            ├── laps.parquet
+            └── weather.parquet
 ```
 
-Session types follow FastF1 conventions: `FP1`, `FP2`, `FP3`, `Q`, `R`.
+Session types follow FastF1 conventions: `FP1`, `FP2`, `FP3`, `Q`, `SQ`, `S`, `R`.
 
 Each Parquet file includes injected partition key columns (`year`, `round_number`, `session_type`) so files can be read independently without path parsing.
 
 ### Tables
 
-| Table | Description |
-|---|---|
-| `driver_info` | One row per driver — number, names, abbreviation, team, country |
-| `session_info` | One row per session — meeting name/circuit/country, start/end dates, GMT offset |
+| Table | Rows | Key columns |
+|---|---|---|
+| `session_info` | 1 per session | `Meeting.Name`, `Meeting.Circuit.ShortName`, `StartDate`, `EndDate`, `GmtOffset` |
+| `driver_info` | 1 per driver | `DriverNumber`, `Abbreviation`, `FullName`, `TeamName`, `CountryCode` |
+| `session_results` | 1 per driver | `Position`, `ClassifiedPosition`, `GridPosition`, `Points`, `Status`, `Time`, `Q1`/`Q2`/`Q3`, `Laps` |
+| `laps` | 1 per lap | `LapNumber`, `LapTime`, `Sector1-3Time`, `Compound`, `TyreLife`, `Stint`, `SpeedI1`/`I2`/`FL`/`ST`, `IsAccurate`, `Deleted` |
+| `weather` | 1 per sample (~1 min intervals) | `Time`, `AirTemp`, `TrackTemp`, `Humidity`, `Pressure`, `Rainfall`, `WindDirection`, `WindSpeed` |
+
+**Timing columns** (`LapTime`, `Sector1-3Time`, `PitOutTime`, `PitInTime`, `Q1`/`Q2`/`Q3`, `Time`) are stored as **float64 seconds** — Parquet has no timedelta type, and seconds are directly usable as model features.
+
+For model training, filter `laps` to `IsAccurate == True` to exclude in/out laps and laps with deleted times.
 
 All files use Snappy compression.
 
@@ -83,10 +93,13 @@ f1-pit-wall/
 │   │   ├── loader.py        # F1SessionLoader, LoadedSession, build_loader()
 │   │   └── strategies.py    # LoadStrategy and SessionSource hierarchies
 │   └── cleaner/
-│       ├── base.py          # BaseCleaner — clean() + Parquet write
-│       ├── registry.py      # CleanerRegistry
-│       ├── session_info.py  # SessionInfoCleaner
-│       └── driver_info.py   # DriverInfoCleaner
+│       ├── base.py              # BaseCleaner — clean() + Parquet write
+│       ├── registry.py          # CleanerRegistry
+│       ├── session_info.py      # SessionInfoCleaner
+│       ├── driver_info.py       # DriverInfoCleaner
+│       ├── session_results.py   # SessionResultsCleaner
+│       ├── laps.py              # LapsCleaner
+│       └── weather.py           # WeatherCleaner
 ├── tests/                   # Unit test suite (pytest, no network calls)
 ├── sandbox/                 # Jupyter notebooks for ad-hoc exploration
 ├── .cache/                  # FastF1 cache (git-ignored)
