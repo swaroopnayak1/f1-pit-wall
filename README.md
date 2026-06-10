@@ -1,6 +1,6 @@
 # F1 Pit Wall
 
-A Formula 1 data ingestion pipeline that fetches session data via [FastF1](https://github.com/theOehrly/Fast-F1), cleans and flattens it, and writes structured Parquet files in a Hive-style partitioned layout.
+A Formula 1 data pipeline that fetches session data via [FastF1](https://github.com/theOehrly/Fast-F1), cleans and flattens it into Hive-partitioned Parquet files, and engineers a model-ready feature matrix for finish-position prediction.
 
 ## Features
 
@@ -9,6 +9,7 @@ A Formula 1 data ingestion pipeline that fetches session data via [FastF1](https
 - **Registry-driven cleaners** — add new table types by registering a cleaner subclass; no orchestrator changes needed
 - **Hive partitioning** — output lands at `data/year={Y}/round={RR}/session={TYPE}/{table}.parquet` for efficient slice queries
 - **Graceful degradation** — unavailable sessions are skipped without aborting the full season run
+- **Feature engineering** — builds a driver × race feature matrix with lag/rolling features and writes `data/features.parquet`
 
 ## Requirements
 
@@ -31,6 +32,8 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Full pipeline (ingestion + feature engineering)
+
 ```bash
 # Single year (defaults to ml mode)
 python -m pipeline.pipeline 2024
@@ -51,18 +54,45 @@ python -m pipeline.pipeline 2024 --offline
 python -m pipeline.pipeline 2024 --out /path/to/output
 ```
 
+### Ingestion only
+
+```bash
+python -m pipeline.pipeline 2024 --module data
+
+# Year range, offline cache
+python -m pipeline.pipeline 2021-2024 --module data --offline
+
+# Visualization mode (includes telemetry)
+python -m pipeline.pipeline 2024 --module data --mode viz
+```
+
+### Feature engineering only
+
+Run against already-written Parquet files without re-fetching from FastF1:
+
+```bash
+python -m pipeline.pipeline 2024 --module fe
+
+# Custom output directory
+python -m pipeline.pipeline 2024 --module fe --out /path/to/data
+
+# Tune hyperparameters (via the feature_engineering module directly)
+python -m pipeline.feature_engineering --ewm-span 8 --roll-window 5
+```
+
 ## Output Structure
 
 ```
 data/
-└── year=2024/
-    └── round=01/
-        └── session=R/
-            ├── session_info.parquet
-            ├── driver_info.parquet
-            ├── session_results.parquet
-            ├── laps.parquet
-            └── weather.parquet
+├── year=2024/
+│   └── round=01/
+│       └── session=R/
+│           ├── session_info.parquet
+│           ├── driver_info.parquet
+│           ├── session_results.parquet
+│           ├── laps.parquet
+│           └── weather.parquet
+└── features.parquet          # model-ready feature matrix (all years combined)
 ```
 
 Session types follow FastF1 conventions: `FP1`, `FP2`, `FP3`, `Q`, `SQ`, `S`, `R`.
@@ -90,35 +120,45 @@ All files use Snappy compression.
 ```
 f1-pit-wall/
 ├── pipeline/
-│   ├── pipeline.py          # Orchestrator and CLI entry point
+│   ├── pipeline.py               # Orchestrator and CLI entry point
 │   ├── loader/
-│   │   ├── loader.py        # F1SessionLoader, LoadedSession, build_loader()
-│   │   └── strategies.py    # LoadStrategy and SessionSource hierarchies
-│   └── cleaner/
-│       ├── base.py              # BaseCleaner — clean() + Parquet write
-│       ├── registry.py          # CleanerRegistry
-│       ├── session_info.py      # SessionInfoCleaner
-│       ├── driver_info.py       # DriverInfoCleaner
-│       ├── session_results.py   # SessionResultsCleaner
-│       ├── laps.py              # LapsCleaner
-│       └── weather.py           # WeatherCleaner
+│   │   ├── loader.py             # F1SessionLoader, LoadedSession, build_loader()
+│   │   └── strategies.py         # LoadStrategy and SessionSource hierarchies
+│   ├── cleaner/
+│   │   ├── base.py               # BaseCleaner — clean() + Parquet write
+│   │   ├── registry.py           # CleanerRegistry
+│   │   ├── session_info.py       # SessionInfoCleaner
+│   │   ├── driver_info.py        # DriverInfoCleaner
+│   │   ├── session_results.py    # SessionResultsCleaner
+│   │   ├── laps.py               # LapsCleaner
+│   │   └── weather.py            # WeatherCleaner
+│   └── feature_engineering/
+│       └── feature_engineering.py  # build_features(), run_feature_engineering(), CLI
 ├── tests/
-│   └── pipeline/
-│       ├── conftest.py          # Shared mock FastF1 fixtures
-│       ├── test_cleaners.py     # Per-table cleaner tests
-│       ├── test_loader.py       # Loader tests
-│       ├── test_pipeline.py     # Orchestrator tests
-│       ├── test_registry.py     # Registry tests
-│       └── test_smoke.py        # Smoke tests
-├── sandbox/                 # Jupyter notebooks for ad-hoc exploration
-├── .cache/                  # FastF1 cache (git-ignored)
-├── data/                    # Pipeline output (git-ignored)
+│   ├── pipeline/
+│   │   ├── conftest.py           # Shared mock FastF1 fixtures
+│   │   ├── test_cleaners.py      # Per-table cleaner tests
+│   │   ├── test_loader.py        # Loader tests
+│   │   ├── test_pipeline.py      # Orchestrator tests
+│   │   ├── test_registry.py      # Registry tests
+│   │   └── test_smoke.py         # Smoke tests
+│   └── feature_engineering/
+│       ├── conftest.py           # Parquet fixture builder
+│       └── test_feature_engineering.py
+├── reports/                  # EDA and feature engineering notebooks
+├── sandbox/                  # Jupyter notebooks for ad-hoc exploration
+├── .cache/                   # FastF1 cache (git-ignored)
+├── data/                     # Pipeline output (git-ignored)
 └── requirements.txt
 ```
 
 ## Architecture
 
-The pipeline is split into two independent strategy hierarchies:
+The pipeline runs in two sequential stages:
+
+### Stage 1 — Ingestion
+
+Fetches and cleans raw FastF1 data into Hive-partitioned Parquet files. Split into two independent strategy hierarchies:
 
 **Load strategies** control *what* data FastF1 fetches:
 - `MLLoadStrategy` — laps + weather only
@@ -129,6 +169,35 @@ The pipeline is split into two independent strategy hierarchies:
 - `OfflineF1Source` — cache-only, deterministic
 
 `build_loader(mode, offline)` composes the right pair. The orchestrator in `pipeline.py` iterates every session of each requested season, runs all registered cleaners, and writes one Parquet file per (session, table) pair.
+
+### Stage 2 — Feature engineering
+
+Reads the race-session (`session=R`) Parquet partitions and builds a flat driver × race feature matrix written to `data/features.parquet`. Steps:
+
+1. Load `session_info`, `driver_info`, `session_results`, and `laps` for all race sessions
+2. Aggregate laps to driver-race level (`LapTime_std`)
+3. Join all sources into a single frame (1 row per driver per race)
+4. Normalise team names across historical constructor rebrands
+5. Compute lag and rolling features sorted by `(DriverId, year, round_number)` to prevent leakage
+
+#### Final feature set
+
+| Feature | Description |
+|---|---|
+| `GridPosition` | Qualifying grid position |
+| `round_number` | Race number within the season |
+| `TeamName` | Constructor (normalised) |
+| `Meeting.Circuit.ShortName` | Circuit identifier |
+| `DriverFinish_lag1` | Previous race finish position |
+| `DriverFinish_ewm` | EWMA of finish positions (span=5, cross-season) |
+| `TeamFinish_ewm` | EWMA of team avg finish (span=5, cross-season) |
+| `DriverFinish_roll3_inseason` | Rolling 3-race finish avg (within-season) |
+| `TeamFinish_roll3_inseason` | Rolling 3-race team avg (within-season) |
+| `LapStd_lag1` | Lap time consistency from previous race |
+
+**Target**: `RacePosition` (finish position)
+
+The EWMA span and rolling window are treated as hyperparameters and can be overridden via CLI flags or the `build_features()` API.
 
 ## Adding a New Table
 
@@ -160,6 +229,7 @@ Tests use mock FastF1 sessions — no network access or cache required.
 |---|---|
 | `pytest tests/ -v` | Verbose output |
 | `pytest tests/pipeline/test_cleaners.py -v` | Cleaner tests only |
+| `pytest tests/feature_engineering/ -v` | Feature engineering tests only |
 | `pytest tests/pipeline/test_registry.py::TestRegister -v` | Single class |
 | `pytest tests/ -x` | Stop on first failure |
 

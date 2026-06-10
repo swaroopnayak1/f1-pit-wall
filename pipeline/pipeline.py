@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from .cleaner import registry
+from .feature_engineering import run_feature_engineering
 from .loader import build_loader, parse_years
 from .loader.strategies import LoadStrategy
 
@@ -45,7 +46,7 @@ def run_pipeline(
     active: list[str] | None = None,
 ) -> None:
     """
-    Run the full pipeline for the given years.
+    Run the data ingestion stage for the given years.
 
     ``mode``    load strategy ("ml" or "viz").
     ``offline`` use the cache-only source (no network).
@@ -82,7 +83,7 @@ def run_pipeline(
                 except Exception as exc:
                     print(f"[ERROR] {tag} {name}: {exc}")
 
-    print("Pipeline complete.")
+    print("Ingestion complete.")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -91,7 +92,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Load FastF1 sessions, clean them, and write Parquet tables.",
         epilog=(
             "Examples:\n"
-            "  python -m pipeline.pipeline 2024\n"
+            "  python -m pipeline.pipeline 2024                       # full pipeline\n"
+            "  python -m pipeline.pipeline 2024 --module data         # ingestion only\n"
+            "  python -m pipeline.pipeline 2024 --module fe           # feature engineering only\n"
             "  python -m pipeline.pipeline 2021 2022 2024 --mode viz\n"
             "  python -m pipeline.pipeline 2021-2024 --offline\n"
             "Note: extensive data is only available from 2018 onwards."
@@ -102,6 +105,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["ml", "viz"], default="ml", help="Load mode (default: ml)")
     parser.add_argument("--offline", action="store_true", help="Use cache only; do not hit the network")
     parser.add_argument("--out", default=str(DEFAULT_OUTPUT_DIR), help="Output root directory")
+    parser.add_argument("--module", choices=["data", "fe", "all"], default="all",
+                        help="Stage to run: data (ingestion only), fe (feature engineering only), all (default)")
     return parser
 
 
@@ -113,7 +118,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Error: {exc}")
         sys.exit(1)
 
-    run_pipeline(years, mode=args.mode, offline=args.offline, output_root=args.out)
+    output_root = Path(args.out)
+
+    if args.module in ("data", "all"):
+        run_pipeline(years, mode=args.mode, offline=args.offline, output_root=output_root)
+    if args.module in ("fe", "all"):
+        run_feature_engineering(output_root)
+
+    print("Done.")
 
 
 if __name__ == "__main__":
