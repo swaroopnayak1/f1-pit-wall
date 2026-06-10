@@ -17,8 +17,10 @@ fastf1
 matplotlib
 numpy
 pandas
+seaborn
 pyarrow
 pytest
+nbconvert
 ```
 
 Install with:
@@ -100,7 +102,14 @@ f1-pit-wall/
 │       ├── session_results.py   # SessionResultsCleaner
 │       ├── laps.py              # LapsCleaner
 │       └── weather.py           # WeatherCleaner
-├── tests/                   # Unit test suite (pytest, no network calls)
+├── tests/
+│   └── pipeline/
+│       ├── conftest.py          # Shared mock FastF1 fixtures
+│       ├── test_cleaners.py     # Per-table cleaner tests
+│       ├── test_loader.py       # Loader tests
+│       ├── test_pipeline.py     # Orchestrator tests
+│       ├── test_registry.py     # Registry tests
+│       └── test_smoke.py        # Smoke tests
 ├── sandbox/                 # Jupyter notebooks for ad-hoc exploration
 ├── .cache/                  # FastF1 cache (git-ignored)
 ├── data/                    # Pipeline output (git-ignored)
@@ -130,6 +139,13 @@ The pipeline is split into two independent strategy hierarchies:
    ```
 3. Add `"my_table"` to `ACTIVE_CLEANERS` in `pipeline/pipeline.py`.
 
+## Running and generating reports
+
+Run the following command with the file name in terminal.
+```bash
+jupyter nbconvert --to html your_notebook.ipynb
+```
+
 ## Running Tests
 
 ```bash
@@ -143,8 +159,8 @@ Tests use mock FastF1 sessions — no network access or cache required.
 | Command | Purpose |
 |---|---|
 | `pytest tests/ -v` | Verbose output |
-| `pytest tests/test_registry.py -v` | Single file |
-| `pytest tests/test_registry.py::TestRegister -v` | Single class |
+| `pytest tests/pipeline/test_cleaners.py -v` | Cleaner tests only |
+| `pytest tests/pipeline/test_registry.py::TestRegister -v` | Single class |
 | `pytest tests/ -x` | Stop on first failure |
 
 ### Reading results
@@ -152,6 +168,14 @@ Tests use mock FastF1 sessions — no network access or cache required.
 - `.` / `PASSED` — test passed
 - `F` / `FAILED` — assertion failed, stacktrace shown below
 - `E` / `ERROR` — setup/teardown error (fixture problem)
+
+## Future Plans
+1. Race win prediction
+    a. With weather support (forecasting) from Tomorrow.io
+2. Pit Strategy prediction
+3. Lap-time prediction
+4. Live telemetry data visualization
+5. F1 chatbot (maybe)
 
 ## License
 
