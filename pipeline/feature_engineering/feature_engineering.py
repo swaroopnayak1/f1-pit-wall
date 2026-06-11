@@ -26,6 +26,8 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from ..loader import parse_years
+
 # ── Grain and join keys ────────────────────────────────────────────────────────
 
 SESSION_FILTER = "R"
@@ -80,15 +82,25 @@ DEFAULT_OUTPUT    = DEFAULT_DATA_ROOT / "features.parquet"
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _load_sources(data_root: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _load_sources(
+    data_root: Path,
+    years: list[int] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Scan data_root for session=R partitions and concatenate the 4 core tables."""
     all_si, all_di, all_sr, all_laps = [], [], [], []
 
     session_dirs = sorted(data_root.glob(f"**/session={SESSION_FILTER}"))
+    if years is not None:
+        year_set = set(years)
+        session_dirs = [
+            sd for sd in session_dirs
+            if int(sd.parent.parent.name.split("=")[1]) in year_set
+        ]
     if not session_dirs:
         raise FileNotFoundError(
-            f"No session={SESSION_FILTER} partitions found under {data_root}. "
-            "Run the ingestion pipeline first."
+            f"No session={SESSION_FILTER} partitions found under {data_root}"
+            + (f" for years {sorted(years)}" if years is not None else "")
+            + ". Run the ingestion pipeline first."
         )
 
     for sd in session_dirs:
@@ -215,6 +227,7 @@ def _add_lag_features(df: pd.DataFrame, *, ewm_span: int, roll_window: int) -> p
 def build_features(
     data_root: str | Path = DEFAULT_DATA_ROOT,
     *,
+    years: list[int] | None = None,
     ewm_span: int = 5,
     roll_window: int = 3,
 ) -> pd.DataFrame:
@@ -235,7 +248,7 @@ def build_features(
     data_root = Path(data_root)
 
     print(f"Loading parquet sources from {data_root} ...")
-    session_info, driver_info, session_results, laps_raw = _load_sources(data_root)
+    session_info, driver_info, session_results, laps_raw = _load_sources(data_root, years)
 
     laps_agg = _aggregate_laps(laps_raw)
     df = _build_race_frame(session_info, driver_info, session_results, laps_agg)
@@ -254,6 +267,7 @@ def run_feature_engineering(
     data_root: str | Path = DEFAULT_DATA_ROOT,
     output_path: str | Path = DEFAULT_OUTPUT,
     *,
+    years: list[int] | None = None,
     ewm_span: int = 5,
     roll_window: int = 3,
 ) -> Path:
@@ -274,7 +288,7 @@ def run_feature_engineering(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = build_features(data_root, ewm_span=ewm_span, roll_window=roll_window)
+    df = build_features(data_root, years=years, ewm_span=ewm_span, roll_window=roll_window)
 
     df.to_parquet(output_path, index=False, compression="snappy")
     print(f"[features] wrote {len(df)} rows ({len(FINAL_FEATURES)} features + target) -> {output_path}")
@@ -318,15 +332,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=3,
         help="Rolling window for within-season features (default: 3; candidates: 3, 5, 7)",
     )
+    parser.add_argument(
+        "--years",
+        nargs="+",
+        default=None,
+        help="Year(s) or range to process, e.g. 2024 / 2021 2022 / 2021-2024. Default: all years in data-root.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _build_arg_parser().parse_args(argv)
+    years: list[int] | None = None
+    if args.years is not None:
+        try:
+            years = parse_years(args.years)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
     try:
         run_feature_engineering(
             data_root=args.data,
             output_path=args.out,
+            years=years,
             ewm_span=args.ewm_span,
             roll_window=args.roll_window,
         )

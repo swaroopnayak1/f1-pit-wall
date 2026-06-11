@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.module in ("data", "all"):
         run_pipeline(years, mode=args.mode, offline=args.offline, output_root=output_root)
     if args.module in ("fe", "all"):
-        run_feature_engineering(output_root)
+        run_feature_engineering(output_root, years=years)
 
     print("Done.")
 

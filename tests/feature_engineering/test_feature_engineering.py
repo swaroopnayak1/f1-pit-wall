@@ -63,6 +63,17 @@ class TestLoadSources:
         *_, laps = _load_sources(data_root)
         assert len(laps) == 24  # 2 years × 3 rounds × 2 drivers × 2 laps
 
+    def test_year_filter_restricts_to_requested_year(self, data_root):
+        si, di, sr, laps = _load_sources(data_root, years=[2024])
+        assert len(si) == 3    # 1 year × 3 rounds
+        assert len(di) == 6    # 1 year × 3 rounds × 2 drivers
+        assert len(sr) == 6
+        assert len(laps) == 12  # 1 year × 3 rounds × 2 drivers × 2 laps
+
+    def test_year_filter_absent_year_raises(self, data_root):
+        with pytest.raises(FileNotFoundError, match="session=R"):
+            _load_sources(data_root, years=[1999])
+
 
 class TestAggregateLaps:
     def test_one_row_per_driver_per_session(self, data_root):
@@ -281,6 +292,11 @@ class TestBuildFeatures:
         df = build_features(data_root, roll_window=5)
         assert "DriverFinish_roll3_inseason" in df.columns
 
+    def test_year_filter_returns_only_requested_year(self, data_root):
+        df = build_features(data_root, years=[2024])
+        assert set(df["year"].unique()) == {2024}
+        assert len(df) == 6  # 1 year × 3 rounds × 2 drivers
+
 
 class TestRunFeatureEngineering:
     def test_writes_parquet_file(self, data_root, tmp_path):
@@ -311,3 +327,10 @@ class TestRunFeatureEngineering:
         out = tmp_path / "features.parquet"
         result = run_feature_engineering(data_root, out)
         assert result == out
+
+    def test_year_filter_writes_only_requested_year(self, data_root, tmp_path):
+        out = tmp_path / "features.parquet"
+        run_feature_engineering(data_root, out, years=[2024])
+        df = pd.read_parquet(out)
+        assert set(df["year"].unique()) == {2024}
+        assert len(df) == 6  # 1 year × 3 rounds × 2 drivers

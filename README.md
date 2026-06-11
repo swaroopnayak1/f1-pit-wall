@@ -32,6 +32,12 @@ pip install -r requirements.txt
 
 ## Usage
 
+Use the `venv`
+```bash
+call C:\Users\<user_name>\anaconda3\Scripts\activate.bat <env_name>
+```
+Replace the `<user_name>` and `<env_name>` as per your configuration.
+
 ### Full pipeline (ingestion + feature engineering)
 
 ```bash
@@ -53,6 +59,8 @@ python -m pipeline.pipeline 2024 --offline
 # Custom output directory
 python -m pipeline.pipeline 2024 --out /path/to/output
 ```
+
+Note: You may have to run the commands several times if the data is being collected from the FastF1 servers due to the rate limits.
 
 ### Ingestion only
 
@@ -170,15 +178,34 @@ Fetches and cleans raw FastF1 data into Hive-partitioned Parquet files. Split in
 
 `build_loader(mode, offline)` composes the right pair. The orchestrator in `pipeline.py` iterates every session of each requested season, runs all registered cleaners, and writes one Parquet file per (session, table) pair.
 
-### Stage 2 — Feature engineering
+### Stage 2 — EDA and Feature engineering
 
-Reads the race-session (`session=R`) Parquet partitions and builds a flat driver × race feature matrix written to `data/features.parquet`. Steps:
+Reads the race-session (`session=R`) Parquet partitions, audits the data, and builds a flat driver × race feature matrix written to `data/features.parquet`.
 
-1. Load `session_info`, `driver_info`, `session_results`, and `laps` for all race sessions
-2. Aggregate laps to driver-race level (`LapTime_std`)
-3. Join all sources into a single frame (1 row per driver per race)
-4. Normalise team names across historical constructor rebrands
-5. Compute lag and rolling features sorted by `(DriverId, year, round_number)` to prevent leakage
+#### EDA
+
+1. **Load and join** — reads all 5 Parquet sources for every `session=R` partition and assembles a single frame at the driver × race grain (1 row per driver per race)
+   - Weather aggregated to session level (mean `RainRisk`, `TrackTemp`, `Humidity`, `Pressure`, `AirTemp`, `WindSpeed`)
+   - Laps aggregated to driver-race level (`LapTime_mean`, `LapTime_std`, `PitCount`)
+2. **Team name normalisation** — maps historical constructor names to their current form so rolling features treat rebrands as one continuous entity (e.g. AlphaTauri → Racing Bulls, Alfa Romeo → Kick Sauber, Racing Point → Aston Martin, Renault → Alpine)
+3. **Schema and null audit** — reviews dtype, null percentage, and cardinality for every column; `Q1`/`Q2`/`Q3` are 100 % null for race sessions (qualifying times are not in the race partition)
+4. **Coverage check** — confirms rounds per season to catch missing partitions before modelling
+5. **Target distribution** — `RacePosition` counts and per-year boxplots to verify a balanced ordinal target across seasons
+6. **Univariate distributions** — histograms for all numeric features to catch skew, outliers, or degenerate columns
+7. **Spearman correlation with target** — ranks all numeric features by |ρ| against `RacePosition`; `GridPosition` is the strongest pre-race signal
+8. **Feature × feature correlation heatmap** — flags pairs with |ρ| > 0.85 as potentially multicollinear
+9. **Leakage registry** — classifies every column as pre-race (safe), post-race (drop or lag), or target; weather features are kept with the caveat that telemetry is used during training and a forecast API must be substituted at inference
+
+#### Feature engineering
+
+1. Compute lag and rolling features sorted by `(DriverId, year, round_number)`; all shifts use `shift(1)` so no current-race data leaks in
+2. Cross-season driver features (`DriverFinish_lag1`, `DriverFinish_ewm`) — grouped by `DriverId` so features carry across season boundaries
+3. Within-season driver feature (`DriverFinish_roll3_inseason`) — grouped by `(DriverId, year)` so the window resets at round 1 each year
+4. Team features (`TeamFinish_ewm`, `TeamFinish_roll3_inseason`) — pre-aggregated to the team-race level before rolling to avoid cross-driver leakage
+5. Season-boundary sanity check: asserts all within-season rolling features are `NaN` at round 1
+6. Spearman correlation of each engineered feature against `RacePosition` with significance markers (p < 0.05 / 0.01 / 0.001)
+7. **Train / test split on season boundary** — 2024 → train, 2025 → test; year overlap asserted to be empty
+8. Lock `FINAL_FEATURES` as the single source of truth imported by the modelling notebook
 
 #### Final feature set
 
