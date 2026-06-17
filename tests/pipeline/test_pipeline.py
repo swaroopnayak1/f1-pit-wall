@@ -2,6 +2,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import pandas as pd
 import pytest
 
 import pipeline.pipeline as pp
@@ -10,6 +11,7 @@ from pipeline.pipeline import (
     ACTIVE_CLEANERS,
     _session_output_dir,
     run_pipeline,
+    split_train_test,
 )
 
 
@@ -153,3 +155,64 @@ class TestRunPipeline:
 
         assert mock_get.call_count == 1
         mock_get.assert_called_with("session_info")
+
+
+# --------------------------------------------------------------------------- #
+# split_train_test
+# --------------------------------------------------------------------------- #
+class TestSplitTrainTest:
+    @pytest.fixture
+    def features_parquet(self, tmp_path) -> Path:
+        """Minimal features.parquet spanning 3 seasons."""
+        df = pd.DataFrame({
+            "year":         [2023, 2023, 2024, 2024, 2025, 2025],
+            "round_number": [1,    2,    1,    2,    1,    2],
+            "DriverId":     ["VER", "HAM", "VER", "HAM", "VER", "HAM"],
+            "RacePosition": [1,    2,    1,    2,    1,    2],
+        })
+        path = tmp_path / "features.parquet"
+        df.to_parquet(path, index=False)
+        return path
+
+    def test_writes_train_and_test_files(self, features_parquet):
+        split_train_test(features_parquet)
+        assert (features_parquet.parent / "train.parquet").exists()
+        assert (features_parquet.parent / "test.parquet").exists()
+
+    def test_test_contains_only_test_year(self, features_parquet):
+        _, test = split_train_test(features_parquet)
+        assert (test["year"] == 2025).all()
+
+    def test_train_excludes_test_year(self, features_parquet):
+        train, _ = split_train_test(features_parquet)
+        assert (train["year"] != 2025).all()
+
+    def test_all_rows_accounted_for(self, features_parquet):
+        train, test = split_train_test(features_parquet)
+        total = pd.read_parquet(features_parquet).shape[0]
+        assert len(train) + len(test) == total
+
+    def test_columns_identical_in_both_splits(self, features_parquet):
+        train, test = split_train_test(features_parquet)
+        assert list(train.columns) == list(test.columns)
+
+    def test_written_files_match_returned_dataframes(self, features_parquet):
+        train, test = split_train_test(features_parquet)
+        pd.testing.assert_frame_equal(train, pd.read_parquet(features_parquet.parent / "train.parquet"))
+        pd.testing.assert_frame_equal(test,  pd.read_parquet(features_parquet.parent / "test.parquet"))
+
+    def test_custom_test_year(self, features_parquet):
+        train, test = split_train_test(features_parquet, test_year=2024)
+        assert (test["year"] == 2024).all()
+        assert set(train["year"].unique()) == {2023, 2025}
+
+    def test_empty_test_when_year_absent(self, features_parquet):
+        _, test = split_train_test(features_parquet, test_year=2030)
+        assert len(test) == 0
+
+    def test_empty_train_when_only_test_year_present(self, tmp_path):
+        df = pd.DataFrame({"year": [2025, 2025], "round_number": [1, 2]})
+        path = tmp_path / "features.parquet"
+        df.to_parquet(path, index=False)
+        train, _ = split_train_test(path)
+        assert len(train) == 0
