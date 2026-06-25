@@ -2,6 +2,7 @@ fastf1
 matplotlib
 numpy
 pandas
+scikit-learn
 seaborn
 pyarrow
 pytest

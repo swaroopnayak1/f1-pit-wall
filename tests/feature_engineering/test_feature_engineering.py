@@ -1,19 +1,27 @@
 """Tests for pipeline.feature_engineering.feature_engineering."""
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from pipeline.feature_engineering.feature_engineering import (
+    CATEGORICAL_FEATURES,
     FINAL_FEATURES,
+    NUMERIC_SCALE_FEATURES,
     TARGET,
     TEAM_NAME_MAP,
     _add_lag_features,
     _aggregate_laps,
     _build_race_frame,
+    _encode_categoricals,
+    _impute_nulls,
     _load_sources,
     _normalise_teams,
+    _scale_features,
     build_features,
     run_feature_engineering,
 )
@@ -259,24 +267,24 @@ class TestAddLagFeatures:
 
 class TestBuildFeatures:
     def test_returns_dataframe(self, data_root):
-        df = build_features(data_root)
+        df, _ = build_features(data_root)
         assert isinstance(df, pd.DataFrame)
 
     def test_contains_all_final_features(self, data_root):
-        df = build_features(data_root)
+        df, _ = build_features(data_root)
         for col in FINAL_FEATURES:
             assert col in df.columns, f"Missing feature: {col}"
 
     def test_contains_target(self, data_root):
-        df = build_features(data_root)
+        df, _ = build_features(data_root)
         assert TARGET in df.columns
 
     def test_row_count(self, data_root):
-        df = build_features(data_root)
+        df, _ = build_features(data_root)
         assert len(df) == 12  # 2 years × 3 rounds × 2 drivers
 
     def test_identifier_columns_present(self, data_root):
-        df = build_features(data_root)
+        df, _ = build_features(data_root)
         for col in ["year", "round_number", "DriverId", "DriverNumber"]:
             assert col in df.columns
 
@@ -285,34 +293,53 @@ class TestBuildFeatures:
             build_features(tmp_path)
 
     def test_custom_ewm_span_accepted(self, data_root):
-        df = build_features(data_root, ewm_span=3)
+        df, _ = build_features(data_root, ewm_span=3)
         assert "DriverFinish_ewm" in df.columns
 
     def test_custom_roll_window_accepted(self, data_root):
-        df = build_features(data_root, roll_window=5)
+        df, _ = build_features(data_root, roll_window=5)
         assert "DriverFinish_roll3_inseason" in df.columns
 
     def test_year_filter_returns_only_requested_year(self, data_root):
-        df = build_features(data_root, years=[2024])
+        df, _ = build_features(data_root, years=[2024])
         assert set(df["year"].unique()) == {2024}
         assert len(df) == 6  # 1 year × 3 rounds × 2 drivers
+
+    def test_returns_preprocessors_dict(self, data_root):
+        _, preprocessors = build_features(data_root)
+        assert "label_encoders" in preprocessors
+        assert "scaler" in preprocessors
+
+    def test_scaler_is_standard_scaler(self, data_root):
+        _, preprocessors = build_features(data_root)
+        assert isinstance(preprocessors["scaler"], StandardScaler)
+
+    def test_categoricals_are_numeric(self, data_root):
+        df, _ = build_features(data_root)
+        for col in CATEGORICAL_FEATURES:
+            assert pd.api.types.is_integer_dtype(df[col]), f"{col} should be integer after encoding"
+
+    def test_no_nulls_in_numeric_features(self, data_root):
+        df, _ = build_features(data_root)
+        for col in NUMERIC_SCALE_FEATURES:
+            assert df[col].isna().sum() == 0, f"Unexpected NaN in {col}"
 
 
 class TestRunFeatureEngineering:
     def test_writes_parquet_file(self, data_root, tmp_path):
         out = tmp_path / "features.parquet"
-        run_feature_engineering(data_root, out)
+        run_feature_engineering(data_root, out, preprocessors_path=None)
         assert out.exists()
 
     def test_parquet_is_readable(self, data_root, tmp_path):
         out = tmp_path / "features.parquet"
-        run_feature_engineering(data_root, out)
+        run_feature_engineering(data_root, out, preprocessors_path=None)
         df = pd.read_parquet(out)
         assert len(df) > 0
 
     def test_parquet_contains_final_features_and_target(self, data_root, tmp_path):
         out = tmp_path / "features.parquet"
-        run_feature_engineering(data_root, out)
+        run_feature_engineering(data_root, out, preprocessors_path=None)
         df = pd.read_parquet(out)
         for col in FINAL_FEATURES:
             assert col in df.columns, f"Missing feature in parquet: {col}"
@@ -320,17 +347,115 @@ class TestRunFeatureEngineering:
 
     def test_creates_output_directory(self, data_root, tmp_path):
         out = tmp_path / "nested" / "dir" / "features.parquet"
-        run_feature_engineering(data_root, out)
+        run_feature_engineering(data_root, out, preprocessors_path=None)
         assert out.exists()
 
     def test_returns_output_path(self, data_root, tmp_path):
         out = tmp_path / "features.parquet"
-        result = run_feature_engineering(data_root, out)
+        result = run_feature_engineering(data_root, out, preprocessors_path=None)
         assert result == out
 
     def test_year_filter_writes_only_requested_year(self, data_root, tmp_path):
         out = tmp_path / "features.parquet"
-        run_feature_engineering(data_root, out, years=[2024])
+        run_feature_engineering(data_root, out, years=[2024], preprocessors_path=None)
         df = pd.read_parquet(out)
         assert set(df["year"].unique()) == {2024}
         assert len(df) == 6  # 1 year × 3 rounds × 2 drivers
+
+    def test_writes_preprocessors_pkl(self, data_root, tmp_path):
+        out = tmp_path / "features.parquet"
+        pkl = tmp_path / "preprocessors.pkl"
+        run_feature_engineering(data_root, out, preprocessors_path=pkl)
+        assert pkl.exists()
+
+    def test_preprocessors_pkl_contains_scaler_and_encoders(self, data_root, tmp_path):
+        out = tmp_path / "features.parquet"
+        pkl = tmp_path / "preprocessors.pkl"
+        run_feature_engineering(data_root, out, preprocessors_path=pkl)
+        with open(pkl, "rb") as fh:
+            preprocessors = pickle.load(fh)
+        assert isinstance(preprocessors["scaler"], StandardScaler)
+        assert set(preprocessors["label_encoders"].keys()) == set(CATEGORICAL_FEATURES)
+
+    def test_preprocessors_path_none_skips_pkl(self, data_root, tmp_path):
+        out = tmp_path / "features.parquet"
+        run_feature_engineering(data_root, out, preprocessors_path=None)
+        assert not any(tmp_path.glob("*.pkl"))
+
+
+class TestEncoding:
+    def test_categorical_columns_become_integer(self, race_frame):
+        df, encoders = _encode_categoricals(race_frame)
+        for col in CATEGORICAL_FEATURES:
+            assert pd.api.types.is_integer_dtype(df[col]), f"{col} should be integer"
+
+    def test_returns_encoder_for_each_categorical(self, race_frame):
+        _, encoders = _encode_categoricals(race_frame)
+        assert set(encoders.keys()) == set(CATEGORICAL_FEATURES)
+        for enc in encoders.values():
+            assert isinstance(enc, LabelEncoder)
+
+    def test_encoding_is_deterministic(self, race_frame):
+        df1, _ = _encode_categoricals(race_frame)
+        df2, _ = _encode_categoricals(race_frame)
+        for col in CATEGORICAL_FEATURES:
+            assert (df1[col].values == df2[col].values).all()
+
+    def test_does_not_mutate_input(self, race_frame):
+        original_team = race_frame["TeamName"].iloc[0]
+        _encode_categoricals(race_frame)
+        assert race_frame["TeamName"].iloc[0] == original_team
+
+
+class TestImputation:
+    def test_no_nulls_after_imputation(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        df = _impute_nulls(df)
+        for col in NUMERIC_SCALE_FEATURES:
+            if col in df.columns:
+                assert df[col].isna().sum() == 0, f"NaN remains in {col} after imputation"
+
+    def test_imputes_with_median(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        median_before = df["DriverFinish_lag1"].median()
+        df = _impute_nulls(df)
+        # Rows that had NaN should now equal the pre-imputation median
+        assert (df["DriverFinish_lag1"] == median_before).any()
+
+    def test_does_not_mutate_input(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        null_count_before = df["DriverFinish_lag1"].isna().sum()
+        _impute_nulls(df)
+        assert df["DriverFinish_lag1"].isna().sum() == null_count_before
+
+
+class TestScaling:
+    def test_returns_standard_scaler(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        df = _impute_nulls(df)
+        _, scaler = _scale_features(df)
+        assert isinstance(scaler, StandardScaler)
+
+    def test_scaled_mean_near_zero(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        df = _impute_nulls(df)
+        df, _ = _scale_features(df)
+        for col in NUMERIC_SCALE_FEATURES:
+            if col in df.columns:
+                assert abs(df[col].mean()) < 1e-10, f"{col} mean not near zero after scaling"
+
+    def test_scaled_std_near_one(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        df = _impute_nulls(df)
+        df, _ = _scale_features(df)
+        for col in NUMERIC_SCALE_FEATURES:
+            if col in df.columns and df[col].nunique() > 1:
+                # StandardScaler divides by population std (ddof=0)
+                assert abs(df[col].std(ddof=0) - 1.0) < 1e-6, f"{col} std not near 1 after scaling"
+
+    def test_does_not_mutate_input(self, race_frame):
+        df = _add_lag_features(race_frame, ewm_span=5, roll_window=3)
+        df = _impute_nulls(df)
+        original_val = df["GridPosition"].iloc[0]
+        _scale_features(df)
+        assert df["GridPosition"].iloc[0] == original_val

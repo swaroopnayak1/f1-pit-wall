@@ -100,7 +100,10 @@ data/
 │           ├── session_results.parquet
 │           ├── laps.parquet
 │           └── weather.parquet
-└── features.parquet          # model-ready feature matrix (all years combined)
+├── features.parquet              # full preprocessed feature matrix (all years)
+├── train.parquet                 # training split (all seasons before test year)
+├── test.parquet                  # held-out test split (test year, e.g. 2025)
+└── features_preprocessors.pkl   # fitted LabelEncoders + StandardScaler
 ```
 
 Session types follow FastF1 conventions: `FP1`, `FP2`, `FP3`, `Q`, `SQ`, `S`, `R`.
@@ -140,8 +143,10 @@ f1-pit-wall/
 │   │   ├── session_results.py    # SessionResultsCleaner
 │   │   ├── laps.py               # LapsCleaner
 │   │   └── weather.py            # WeatherCleaner
-│   └── feature_engineering/
-│       └── feature_engineering.py  # build_features(), run_feature_engineering(), CLI
+│   ├── feature_engineering/
+│   │   └── feature_engineering.py  # build_features(), run_feature_engineering(), CLI
+│   └── model/
+│       └── baseline.ipynb          # GridPosition and DummyRegressor baselines
 ├── tests/
 │   ├── pipeline/
 │   │   ├── conftest.py           # Shared mock FastF1 fixtures
@@ -207,6 +212,17 @@ Reads the race-session (`session=R`) Parquet partitions, audits the data, and bu
 7. **Train / test split on season boundary** — 2024 → train, 2025 → test; year overlap asserted to be empty
 8. Lock `FINAL_FEATURES` as the single source of truth imported by the modelling notebook
 
+#### Preprocessing
+
+Applied after feature construction, in this order:
+
+1. **Drop target-null rows** — rows where `RacePosition` is NaN (DNF/DNS/DSQ with no classified position) are dropped before any fitting step
+2. **Label-encode categoricals** — `TeamName` and `Meeting.Circuit.ShortName` are encoded to integer codes using `LabelEncoder` (alphabetical class ordering); encoders are fit on the full dataset and saved to the preprocessors artifact
+3. **Median imputation** — remaining NaN in numeric features (e.g. `DriverFinish_lag1` at round 1, `LapStd_lag1`) are filled with each column's median; imputation happens on the full dataset before splitting
+4. **StandardScaler** — all numeric features are zero-centred and unit-variance scaled; the fitted scaler is saved to the preprocessors artifact
+
+The fitted `LabelEncoder` instances and `StandardScaler` are persisted together to `data/features_preprocessors.pkl` so the same transforms can be reapplied at inference without re-fitting.
+
 #### Final feature set
 
 | Feature | Description |
@@ -225,6 +241,36 @@ Reads the race-session (`session=R`) Parquet partitions, audits the data, and bu
 **Target**: `RacePosition` (finish position)
 
 The EWMA span and rolling window are treated as hyperparameters and can be overridden via CLI flags or the `build_features()` API.
+
+## Models
+
+### Stage 3 — Baseline Models
+
+Establishes lower-bound benchmarks in `pipeline/model/baseline.ipynb` that every subsequent model must beat. Loads `data/train.parquet` and `data/test.parquet` produced by the feature engineering pipeline.
+
+#### Metrics
+
+| Metric | Description |
+|---|---|
+| **MAE** | Mean Absolute Error — average position error in race positions |
+| **Spearman ρ** | Rank-order correlation between predicted and actual finishing order |
+| **Macro F1** | Continuous predictions rounded to the nearest position (1–20); F1 averaged equally over all 20 classes regardless of frequency |
+
+#### Baselines
+
+| Model | Strategy | Rationale |
+|---|---|---|
+| **GridPosition** | Rule-based: predict finish = grid position | Strong real-world heuristic in F1; sets a meaningful performance bar |
+| **DummyRegressor** | Always predict training-set mean position | Statistical floor; establishes minimum MAE from zero-signal prediction |
+
+#### Results (test set)
+
+| Model | MAE | Spearman ρ | Macro F1 |
+|---|---|---|---|
+| GridPosition | 10.44 | 0.652 | 0.005 |
+| DummyRegressor | 4.99 | 0.000 | 0.005 |
+
+A trained model must beat **both** baselines on **all three** metrics to be considered useful. Note that DummyRegressor achieves a lower MAE (predicts near the middle of the 1–20 range) but has no ranking or classification power — Spearman ρ and Macro F1 near zero confirm this.
 
 ## Adding a New Table
 

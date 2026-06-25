@@ -10,21 +10,29 @@ Steps
 2. Join into a single driver × race frame
 3. Normalise team names across historical rebrands
 4. Compute lag / rolling features (sorted to prevent leakage)
-5. Write the final feature matrix + target to a single Parquet file
+5. Label-encode categorical features
+6. Impute remaining nulls with column medians
+7. Standardise numeric features with StandardScaler
+8. Write the final feature matrix + target to a single Parquet file
 
 Output
 ------
     <output_path>  (default: data/features.parquet)
     Columns: year, round_number, DriverId, DriverNumber, FINAL_FEATURES, TARGET
+
+    <scaler_path>  (default: data/features_preprocessors.pkl)
+    Pickle containing {"label_encoders": dict[str, LabelEncoder], "scaler": StandardScaler}
 """
 from __future__ import annotations
 
 import argparse
+import pickle
 import sys
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from ..loader import parse_years
 
@@ -57,7 +65,7 @@ FINAL_FEATURES: list[str] = [
     # Pre-race, always known
     "GridPosition",
     "round_number",
-    # Categorical (encode before modelling)
+    # Categorical — label-encoded to int during feature engineering
     "TeamName",
     "Meeting.Circuit.ShortName",
     # Cross-season exponential moving average (decays older data)
@@ -71,13 +79,32 @@ FINAL_FEATURES: list[str] = [
     "LapStd_lag1",
 ]
 
+# Categorical features that are label-encoded to integer codes
+CATEGORICAL_FEATURES: list[str] = [
+    "TeamName",
+    "Meeting.Circuit.ShortName",
+]
+
+# Continuous numeric features — imputed with median then standardised
+NUMERIC_SCALE_FEATURES: list[str] = [
+    "GridPosition",
+    "round_number",
+    "DriverFinish_lag1",
+    "DriverFinish_ewm",
+    "TeamFinish_ewm",
+    "DriverFinish_roll3_inseason",
+    "TeamFinish_roll3_inseason",
+    "LapStd_lag1",
+]
+
 TARGET = "RacePosition"
 
 # ── Default paths ──────────────────────────────────────────────────────────────
 
-_PIPELINE_ROOT    = Path(__file__).resolve().parent.parent.parent
-DEFAULT_DATA_ROOT = _PIPELINE_ROOT / "data"
-DEFAULT_OUTPUT    = DEFAULT_DATA_ROOT / "features.parquet"
+_PIPELINE_ROOT          = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DATA_ROOT       = _PIPELINE_ROOT / "data"
+DEFAULT_OUTPUT          = DEFAULT_DATA_ROOT / "features.parquet"
+DEFAULT_PREPROCESSORS   = DEFAULT_DATA_ROOT / "features_preprocessors.pkl"
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -222,6 +249,36 @@ def _add_lag_features(df: pd.DataFrame, *, ewm_span: int, roll_window: int) -> p
     return df
 
 
+def _encode_categoricals(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, LabelEncoder]]:
+    """Label-encode CATEGORICAL_FEATURES columns in place (alphabetical classes)."""
+    df = df.copy()
+    encoders: dict[str, LabelEncoder] = {}
+    for col in CATEGORICAL_FEATURES:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+        encoders[col] = le
+    return df, encoders
+
+
+def _impute_nulls(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill NaN in NUMERIC_SCALE_FEATURES with each column's median."""
+    df = df.copy()
+    for col in NUMERIC_SCALE_FEATURES:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+    return df
+
+
+def _scale_features(df: pd.DataFrame) -> tuple[pd.DataFrame, StandardScaler]:
+    """Standardise NUMERIC_SCALE_FEATURES (zero mean, unit variance)."""
+    df = df.copy()
+    scaler = StandardScaler()
+    df[NUMERIC_SCALE_FEATURES] = scaler.fit_transform(df[NUMERIC_SCALE_FEATURES])
+    return df, scaler
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def build_features(
@@ -230,7 +287,7 @@ def build_features(
     years: list[int] | None = None,
     ewm_span: int = 5,
     roll_window: int = 3,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """
     Build the full feature matrix from ingestion-pipeline Parquet outputs.
 
@@ -242,8 +299,9 @@ def build_features(
 
     Returns
     -------
-    DataFrame with columns: year, round_number, DriverId, DriverNumber,
-    FINAL_FEATURES, TARGET.
+    (df, preprocessors) where df has columns: year, round_number, DriverId,
+    DriverNumber, FINAL_FEATURES, TARGET; and preprocessors is a dict with
+    keys "label_encoders" (dict[str, LabelEncoder]) and "scaler" (StandardScaler).
     """
     data_root = Path(data_root)
 
@@ -257,10 +315,21 @@ def build_features(
 
     df = _normalise_teams(df)
     df = _add_lag_features(df, ewm_span=ewm_span, roll_window=roll_window)
+    df, label_encoders = _encode_categoricals(df)
 
     id_cols = ["year", "round_number", "DriverId", "DriverNumber"]
     keep    = list(dict.fromkeys(id_cols + FINAL_FEATURES + [TARGET]))
-    return df[[c for c in keep if c in df.columns]]
+    df = df[[c for c in keep if c in df.columns]]
+
+    before = len(df)
+    df = df.dropna(subset=[TARGET])
+    dropped = before - len(df)
+    if dropped:
+        print(f"[features] dropped {dropped} rows with NaN {TARGET} (DNF/DNS/DSQ)")
+
+    df = _impute_nulls(df)
+    df, scaler = _scale_features(df)
+    return df, {"label_encoders": label_encoders, "scaler": scaler}
 
 
 def run_feature_engineering(
@@ -270,28 +339,40 @@ def run_feature_engineering(
     years: list[int] | None = None,
     ewm_span: int = 5,
     roll_window: int = 3,
+    preprocessors_path: str | Path | None = DEFAULT_PREPROCESSORS,
 ) -> Path:
     """
     Build features and write to a single Parquet file.
 
     Parameters
     ----------
-    data_root:   Root of the Hive-partitioned Parquet dataset.
-    output_path: Destination Parquet file (created with snappy compression).
-    ewm_span:    EWMA span (default 5; candidates: 3, 5, 8, 10).
-    roll_window: Rolling window (default 3; candidates: 3, 5, 7).
+    data_root:          Root of the Hive-partitioned Parquet dataset.
+    output_path:        Destination Parquet file (created with snappy compression).
+    ewm_span:           EWMA span (default 5; candidates: 3, 5, 8, 10).
+    roll_window:        Rolling window (default 3; candidates: 3, 5, 7).
+    preprocessors_path: Destination pickle for label encoders + scaler (pass None
+                        to skip). Default: data/features_preprocessors.pkl.
 
     Returns
     -------
-    Path to the written file.
+    Path to the written Parquet file.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = build_features(data_root, years=years, ewm_span=ewm_span, roll_window=roll_window)
+    df, preprocessors = build_features(
+        data_root, years=years, ewm_span=ewm_span, roll_window=roll_window
+    )
 
     df.to_parquet(output_path, index=False, compression="snappy")
     print(f"[features] wrote {len(df)} rows ({len(FINAL_FEATURES)} features + target) -> {output_path}")
+
+    if preprocessors_path is not None:
+        preprocessors_path = Path(preprocessors_path)
+        preprocessors_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(preprocessors_path, "wb") as fh:
+            pickle.dump(preprocessors, fh)
+        print(f"[features] wrote preprocessors -> {preprocessors_path}")
 
     return output_path
 
