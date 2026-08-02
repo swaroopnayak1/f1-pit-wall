@@ -18,10 +18,13 @@ fastf1
 matplotlib
 numpy
 pandas
+scikit-learn
 seaborn
 pyarrow
 pytest
 nbconvert
+lightgbm
+shap
 ```
 
 Install with:
@@ -146,7 +149,9 @@ f1-pit-wall/
 │   ├── feature_engineering/
 │   │   └── feature_engineering.py  # build_features(), run_feature_engineering(), CLI
 │   └── model/
-│       └── baseline.ipynb          # GridPosition and DummyRegressor baselines
+│       ├── baseline.ipynb          # GridPosition and DummyRegressor baselines
+│       ├── random_forest.ipynb     # RandomForestRegressor, temporal CV + test evaluation
+│       └── lightgbm.ipynb          # LGBMRegressor, temporal CV + test evaluation
 ├── tests/
 │   ├── pipeline/
 │   │   ├── conftest.py           # Shared mock FastF1 fixtures
@@ -158,7 +163,7 @@ f1-pit-wall/
 │   └── feature_engineering/
 │       ├── conftest.py           # Parquet fixture builder
 │       └── test_feature_engineering.py
-├── reports/                  # EDA and feature engineering notebooks
+├── reports/                  # EDA, feature engineering, and SHAP analysis notebooks + saved model results
 ├── sandbox/                  # Jupyter notebooks for ad-hoc exploration
 ├── .cache/                   # FastF1 cache (git-ignored)
 ├── data/                     # Pipeline output (git-ignored)
@@ -272,6 +277,55 @@ Establishes lower-bound benchmarks in `pipeline/model/baseline.ipynb` that every
 
 A trained model must beat **both** baselines on **all three** metrics to be considered useful. Note that DummyRegressor achieves a lower MAE (predicts near the middle of the 1–20 range) but has no ranking or classification power — Spearman ρ and Macro F1 near zero confirm this.
 
+### Stage 4 — Random Forest and LightGBM
+
+Trains a `RandomForestRegressor` (`pipeline/model/random_forest.ipynb`) and an `LGBMRegressor` (`pipeline/model/lightgbm.ipynb`), both with default hyperparameters (only `random_state=42` fixed for reproducibility), using the same `FINAL_FEATURES` and metrics as the baseline notebook for direct comparison.
+
+Both are evaluated with **temporal cross-validation** — an expanding-window walk-forward split over the 6 training seasons (2019–2024), so every fold trains only on seasons strictly before its validation season, mirroring real deployment (predict an upcoming season from past ones only):
+
+| Fold | Train years | Validation year |
+|---|---|---|
+| 1 | 2019 | 2020 |
+| 2 | 2019–2020 | 2021 |
+| 3 | 2019–2021 | 2022 |
+| 4 | 2019–2022 | 2023 |
+| 5 | 2019–2023 | 2024 |
+
+Each notebook also refits on the full 2019–2024 training set and scores once on the held-out 2025 test set, and computes native feature importance (Gini/impurity-based for Random Forest, split-count-based for LightGBM — not directly comparable across the two models). CV results are saved to `reports/random_forest_cv_results.csv` / `reports/lightgbm_cv_results.csv`; test-set comparisons (cumulative, including baselines) to `reports/random_forest_test_results.csv` / `reports/lightgbm_test_results.csv`.
+
+#### Results (test set, 2025)
+
+| Model | MAE | Spearman ρ | Macro F1 |
+|---|---|---|---|
+| GridPosition | 10.44 | 0.652 | 0.005 |
+| DummyRegressor | 4.99 | 0.000 | 0.005 |
+| RandomForest | 3.53 | 0.617 | 0.077 |
+| LightGBM | 3.52 | 0.608 | 0.088 |
+
+Both models clear both baselines on MAE and Macro F1, and stay close to `GridPosition` on Spearman ρ. Neither is tuned — these are first-pass, default-hyperparameter numbers.
+
+#### Takeaways
+
+- **Overfitting is severe for Random Forest with default params**: train MAE is 1.26 vs. 3.54 (CV mean) and 3.53 (test) — a ~2.3-point gap, with train Spearman ρ 0.97 vs. CV 0.61. Unbounded tree depth lets the forest memorize training seasons; `max_depth`, `min_samples_leaf`, and `max_features` are the highest-priority regularization targets.
+- **LightGBM overfits less out of the box**: train MAE is 2.11 vs. 3.64 (CV mean) and 3.52 (test) — a ~1.5-point gap, narrower than Random Forest's. Boosted, shallower trees generalize somewhat better by default, though `num_leaves`, `min_child_samples`, and early stopping on `n_estimators` are still worth tuning.
+- **Feature importance concentration differs sharply between the two models**: for Random Forest, `GridPosition` alone accounts for ~30% of impurity-based importance, followed by `TeamFinish_ewm` (~23%) and `DriverFinish_ewm` (~11%). For LightGBM, split-count importance is more evenly spread — `DriverFinish_ewm`, `TeamFinish_ewm`, and `LapStd_lag1` lead, while `GridPosition` ranks only 6th of 10 — LightGBM's boosting spreads splits across engineered rolling/EWM form features rather than concentrating on qualifying position.
+
+### Stage 5 — SHAP Analysis
+
+`reports/shap_analysis.ipynb` explains the LightGBM model's predictions using **SHAP (SHapley Additive exPlanations)**, computed with `shap.TreeExplainer` (exact for tree ensembles) on the same held-out 2025 test set used for final evaluation. Unlike native feature importance, SHAP attributes each individual prediction to its input features in units of the target (finishing positions), with a sign — showing not just which features matter, but how and in which direction they push a given prediction.
+
+Views produced, in order: global importance (mean |SHAP| bar plot), a beeswarm plot (per-instance magnitude and direction), waterfall and force plots for the best- and worst-predicted 2025 rows, dependence/scatter plots for the top 3 features by mean |SHAP|, a heatmap across all test instances, and a decision plot comparing the best vs. worst predictions feature-by-feature.
+
+**Note on feature scale**: `FINAL_FEATURES` are post-preprocessing — the 8 continuous features are standardised (zero mean, unit variance) and the 2 categorical features (`TeamName`, `Meeting.Circuit.ShortName`) are label-encoded integers, so plot axes show z-scores/codes rather than raw grid positions or team names.
+
+#### Takeaways
+
+- The mean |SHAP| ranking mostly agrees with, but refines, LightGBM's native split-count importance — SHAP is denominated in actual output impact (finishing positions) rather than split frequency, so features split on often but with small, offsetting effects rank lower here.
+- The beeswarm plot exposes direction, not just magnitude: a consistent colour gradient for a feature (e.g. `GridPosition`) indicates a monotonic relationship the model has learned reliably, while a mixed-colour spread indicates the effect depends on interactions with other features.
+- Best- vs. worst-prediction waterfall/force/decision plots show qualitatively different shapes — the best prediction typically has a small number of features agreeing on a confident push toward the correct position, while the worst prediction shows large, conflicting contributions, suggesting the model was working from misleading or unusually noisy inputs.
+- The heatmap is the most useful single view for spotting systematic subgroups — clusters of test rows with similar SHAP patterns often correspond to real-world groupings (e.g. a team's mid-season form spike) that aren't explicit features in the model.
+- **Caveat**: SHAP explains the model's *learned* behaviour, not ground-truth causality — a feature with high SHAP impact is only as trustworthy as the model itself, which still shows a meaningful train/test generalisation gap (see Stage 4 takeaways).
+
 ## Adding a New Table
 
 1. Create a cleaner in `pipeline/cleaner/` that subclasses `BaseCleaner` and implements `table_name` and `clean()`.
@@ -319,6 +373,9 @@ Tests use mock FastF1 sessions — no network access or cache required.
 3. Lap-time prediction
 4. Live telemetry data visualization
 5. F1 chatbot (maybe)
+
+## TODO
+- **Weather forecast pipeline + feature integration** — `weather.parquet` is ingested and cleaned per session, but `build_features()` never loads or joins it, so no weather column reaches `FINAL_FEATURES` today. The EDA leakage registry (see [Architecture](#stage-2--eda-and-feature-engineering)) marked `RainRisk`/`TrackTemp`/`Humidity`/`Pressure`/`AirTemp`/`WindSpeed` as "keep w/ caveat": training can use actual session telemetry (no leakage, since both target and weather are post-race), but inference needs a forecast substitute since the race hasn't happened yet. Need to: (1) join session-level weather aggregates into the race frame, (2) build a forecast-fetch step (e.g. Tomorrow.io) for pre-race prediction, and (3) reconcile the train/inference distribution mismatch before adding weather to `FINAL_FEATURES`.
 
 ## License
 
