@@ -25,6 +25,7 @@ pytest
 nbconvert
 lightgbm
 shap
+statsmodels
 ```
 
 Install with:
@@ -279,7 +280,7 @@ A trained model must beat **both** baselines on **all three** metrics to be cons
 
 ### Stage 4 — Random Forest and LightGBM
 
-Trains a `RandomForestRegressor` (`pipeline/model/random_forest.ipynb`) and an `LGBMRegressor` (`pipeline/model/lightgbm.ipynb`), both with default hyperparameters (only `random_state=42` fixed for reproducibility), using the same `FINAL_FEATURES` and metrics as the baseline notebook for direct comparison.
+Trains a `RandomForestRegressor` (`pipeline/model/random_forest.ipynb`) and an `LGBMRegressor` (`pipeline/model/lightgbm.ipynb`), both with default hyperparameters (only `random_state=42` fixed for reproducibility), starting from the same `FINAL_FEATURES` and metrics as the baseline notebook for direct comparison.
 
 Both are evaluated with **temporal cross-validation** — an expanding-window walk-forward split over the 6 training seasons (2019–2024), so every fold trains only on seasons strictly before its validation season, mirroring real deployment (predict an upcoming season from past ones only):
 
@@ -291,24 +292,31 @@ Both are evaluated with **temporal cross-validation** — an expanding-window wa
 | 4 | 2019–2022 | 2023 |
 | 5 | 2019–2023 | 2024 |
 
-Each notebook also refits on the full 2019–2024 training set and scores once on the held-out 2025 test set, and computes native feature importance (Gini/impurity-based for Random Forest, split-count-based for LightGBM — not directly comparable across the two models). CV results are saved to `reports/random_forest_cv_results.csv` / `reports/lightgbm_cv_results.csv`; test-set comparisons (cumulative, including baselines) to `reports/random_forest_test_results.csv` / `reports/lightgbm_test_results.csv`.
+Each notebook also refits on the full 2019–2024 training set, scores once on the held-out 2025 test set, and computes native feature importance (Gini/impurity-based for Random Forest, split-count-based for LightGBM — not directly comparable across the two models).
 
-#### Results (test set, 2025)
+**Feature selection (VIF + importance)**: after the first-pass fit on all 10 `FINAL_FEATURES`, each notebook computes Variance Inflation Factor (VIF) on the 8 continuous/rolling features (the 2 label-encoded categoricals are excluded — a linear-redundancy statistic isn't meaningful for an arbitrary numeric encoding) and drops a feature only if it's *both* near-zero importance (impurity/split-count share below the 10% uniform baseline) *and* highly collinear (VIF > 5). Both models flag the same 4 EWM/rolling-mean feature pairs as collinear (VIF 18–25), but differ on what to drop because their importance rankings differ:
+- **Random Forest** drops `TeamFinish_roll3_inseason` and `DriverFinish_roll3_inseason` (8 features retained) — their `_ewm` counterparts carry far more importance.
+- **LightGBM** drops only `DriverFinish_roll3_inseason` (9 features retained) — `TeamFinish_roll3_inseason` importance (11.3%) stays just above the near-zero bar.
+
+Each notebook reruns temporal CV and the 2025 test evaluation on its reduced feature set and confirms no regression against the all-features run (deltas are within each model's fold-to-fold CV std). CV results are saved to `reports/random_forest_cv_results.csv` / `reports/lightgbm_cv_results.csv`; test-set comparisons (cumulative, including baselines) to `reports/random_forest_test_results.csv` / `reports/lightgbm_test_results.csv` — both reflect the reduced feature sets, not the diagnostic all-10-feature fit.
+
+#### Results (test set, 2025, reduced feature sets)
 
 | Model | MAE | Spearman ρ | Macro F1 |
 |---|---|---|---|
 | GridPosition | 10.44 | 0.652 | 0.005 |
 | DummyRegressor | 4.99 | 0.000 | 0.005 |
-| RandomForest | 3.53 | 0.617 | 0.077 |
-| LightGBM | 3.52 | 0.608 | 0.088 |
+| RandomForest (8 features) | 3.52 | 0.614 | 0.080 |
+| LightGBM (9 features) | 3.54 | 0.598 | 0.092 |
 
 Both models clear both baselines on MAE and Macro F1, and stay close to `GridPosition` on Spearman ρ. Neither is tuned — these are first-pass, default-hyperparameter numbers.
 
 #### Takeaways
 
-- **Overfitting is severe for Random Forest with default params**: train MAE is 1.26 vs. 3.54 (CV mean) and 3.53 (test) — a ~2.3-point gap, with train Spearman ρ 0.97 vs. CV 0.61. Unbounded tree depth lets the forest memorize training seasons; `max_depth`, `min_samples_leaf`, and `max_features` are the highest-priority regularization targets.
-- **LightGBM overfits less out of the box**: train MAE is 2.11 vs. 3.64 (CV mean) and 3.52 (test) — a ~1.5-point gap, narrower than Random Forest's. Boosted, shallower trees generalize somewhat better by default, though `num_leaves`, `min_child_samples`, and early stopping on `n_estimators` are still worth tuning.
+- **Overfitting is severe for Random Forest with default params**: train MAE is 1.26 vs. 3.54 (CV mean) and 3.53 (test, all-features) — a ~2.3-point gap, with train Spearman ρ 0.97 vs. CV 0.61. Unbounded tree depth lets the forest memorize training seasons; `max_depth`, `min_samples_leaf`, and `max_features` are the highest-priority regularization targets.
+- **LightGBM overfits less out of the box**: train MAE is 2.11 vs. 3.64 (CV mean) and 3.52 (test, all-features) — a ~1.5-point gap, narrower than Random Forest's. Boosted, shallower trees generalize somewhat better by default, though `num_leaves`, `min_child_samples`, and early stopping on `n_estimators` are still worth tuning.
 - **Feature importance concentration differs sharply between the two models**: for Random Forest, `GridPosition` alone accounts for ~30% of impurity-based importance, followed by `TeamFinish_ewm` (~23%) and `DriverFinish_ewm` (~11%). For LightGBM, split-count importance is more evenly spread — `DriverFinish_ewm`, `TeamFinish_ewm`, and `LapStd_lag1` lead, while `GridPosition` ranks only 6th of 10 — LightGBM's boosting spreads splits across engineered rolling/EWM form features rather than concentrating on qualifying position.
+- **Trimming collinear, near-zero-importance features costs nothing**: dropping the redundant `_roll3_inseason` feature(s) moves CV MAE by ≤0.01 and test MAE by ≤0.02 for both models — well inside CV fold-to-fold std (~0.24 for Random Forest, ~0.31 for LightGBM) — so the smaller, less redundant feature set is kept as the model actually saved.
 
 ### Stage 5 — SHAP Analysis
 
