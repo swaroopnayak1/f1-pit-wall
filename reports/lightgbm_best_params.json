@@ -1,0 +1,14 @@
+{
+  "cv_mae": 3.3969438217962233,
+  "params": {
+    "n_estimators": 614,
+    "num_leaves": 40,
+    "max_depth": 3,
+    "learning_rate": 0.008381172712733035,
+    "min_child_samples": 17,
+    "reg_alpha": 0.4561618416669044,
+    "reg_lambda": 0.017167180659618215,
+    "subsample": 0.8307963751746064,
+    "colsample_bytree": 0.7133774016145881
+  }
+}
