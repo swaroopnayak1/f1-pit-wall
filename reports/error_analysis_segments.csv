@@ -1,0 +1,13 @@
+group,n,MAE,bias,segment
+Permanent,339,3.433,-0.075,circuit_type
+Street,140,3.132,-0.071,circuit_type
+Dry,359,3.372,-0.071,rain_gt_0
+Rain,120,3.263,-0.082,rain_gt_0
+Dry,419,3.287,-0.082,rain_gt_0.05
+Rain,60,3.75,-0.013,rain_gt_0.05
+Rookie,115,3.17,-0.54,experience
+Veteran,364,3.4,0.074,experience
+Podium (1-3),72,3.166,3.153,position_tier
+Points (4-10),168,3.052,2.703,position_tier
+Midfield (11-15),120,1.589,-0.379,position_tier
+Back (16-20),119,5.637,-5.637,position_tier

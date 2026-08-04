@@ -26,6 +26,7 @@ nbconvert
 lightgbm
 shap
 statsmodels
+optuna
 ```
 
 Install with:
@@ -152,7 +153,8 @@ f1-pit-wall/
 │   └── model/
 │       ├── baseline.ipynb          # GridPosition and DummyRegressor baselines
 │       ├── random_forest.ipynb     # RandomForestRegressor, temporal CV + test evaluation
-│       └── lightgbm.ipynb          # LGBMRegressor, temporal CV + test evaluation
+│       ├── lightgbm.ipynb          # LGBMRegressor, temporal CV + test evaluation, Optuna comparison
+│       └── tune_lightgbm.py        # Optuna hyperparameter search (CLI)
 ├── tests/
 │   ├── pipeline/
 │   │   ├── conftest.py           # Shared mock FastF1 fixtures
@@ -164,7 +166,7 @@ f1-pit-wall/
 │   └── feature_engineering/
 │       ├── conftest.py           # Parquet fixture builder
 │       └── test_feature_engineering.py
-├── reports/                  # EDA, feature engineering, and SHAP analysis notebooks + saved model results
+├── reports/                  # EDA, feature engineering, SHAP, and error analysis notebooks + saved model results
 ├── sandbox/                  # Jupyter notebooks for ad-hoc exploration
 ├── .cache/                   # FastF1 cache (git-ignored)
 ├── data/                     # Pipeline output (git-ignored)
@@ -318,7 +320,44 @@ Both models clear both baselines on MAE and Macro F1, and stay close to `GridPos
 - **Feature importance concentration differs sharply between the two models**: for Random Forest, `GridPosition` alone accounts for ~30% of impurity-based importance, followed by `TeamFinish_ewm` (~23%) and `DriverFinish_ewm` (~11%). For LightGBM, split-count importance is more evenly spread — `DriverFinish_ewm`, `TeamFinish_ewm`, and `LapStd_lag1` lead, while `GridPosition` ranks only 6th of 10 — LightGBM's boosting spreads splits across engineered rolling/EWM form features rather than concentrating on qualifying position.
 - **Trimming collinear, near-zero-importance features costs nothing**: dropping the redundant `_roll3_inseason` feature(s) moves CV MAE by ≤0.01 and test MAE by ≤0.02 for both models — well inside CV fold-to-fold std (~0.24 for Random Forest, ~0.31 for LightGBM) — so the smaller, less redundant feature set is kept as the model actually saved.
 
-### Stage 5 — SHAP Analysis
+### Stage 5 — Optuna Hyperparameter Tuning
+
+`pipeline/model/tune_lightgbm.py` runs an Optuna search over LightGBM hyperparameters (TPE sampler, `MedianPruner` with 2 warm-up steps), minimizing mean MAE across the same 5-fold expanding-window temporal CV as Stage 4. Only `train.parquet` (2019–2024) is loaded during the search — the 2025 test season is never read, and trials are ranked purely on out-of-sample CV MAE.
+
+```bash
+python pipeline/model/tune_lightgbm.py --n-trials 50
+
+# Resumable study backed by persistent storage
+python pipeline/model/tune_lightgbm.py --n-trials 100 --storage sqlite:///reports/lightgbm_optuna.db
+```
+
+Search space (widened from an initial pass after best trials pinned at the original floors — cross-checked against `optuna_integration.lightgbm.LightGBMTuner`'s default ranges):
+
+| Param | Range |
+|---|---|
+| `n_estimators` | 50–1000 |
+| `num_leaves` | 7–63 |
+| `max_depth` | 2–8 |
+| `learning_rate` | 0.003–0.3 (log scale) |
+| `min_child_samples` | 5–50 |
+| `reg_alpha`, `reg_lambda` | 1e-8–10.0 (log scale) |
+| `subsample`, `colsample_bytree` | 0.4–1.0 |
+
+The 50-trial search lands on a much slower, shallower model than the untuned defaults: `n_estimators=614`, `max_depth=3`, `learning_rate≈0.0084` (full params in `reports/lightgbm_best_params.json`; per-trial log in `reports/lightgbm_optuna_trials.csv`). `lightgbm.ipynb` Section 11a refits this configuration on the full 2019–2024 training set and scores once on 2025:
+
+| Model | MAE | Spearman ρ | Macro F1 |
+|---|---|---|---|
+| LightGBM (default, all features) | 3.52 | 0.61 | 0.092 |
+| LightGBM (Optuna-tuned, all features) | 3.34 | 0.65 | 0.058 |
+
+Saved to `reports/lightgbm_tuned_cv_results.csv` and `reports/lightgbm_tuned_test_results.csv` — kept separate from `lightgbm_cv_results.csv`/`lightgbm_test_results.csv`, which still reflect the untuned, reduced-feature model referenced elsewhere (SHAP analysis, main results table).
+
+#### Takeaways
+
+- **MAE and rank correlation improve, but Macro F1 gets worse**: tuning cuts test MAE from 3.52 to 3.34 and lifts Spearman ρ from 0.61 to 0.65, but Macro F1 drops from 0.092 to 0.058. The objective was MAE only, so the search had no incentive to keep predictions spread across all 20 position classes — the low learning rate likely produces smoother, more conservative predictions clustered in a narrower band, which helps "how far off" but hurts "exact position hit rate."
+- Whether that tradeoff is worth taking depends on the downstream use case — it isn't a strict win, so the tuned model is reported alongside the untuned one rather than replacing it as the project's reference LightGBM result.
+
+### Stage 6 — SHAP Analysis
 
 `reports/shap_analysis.ipynb` explains the LightGBM model's predictions using **SHAP (SHapley Additive exPlanations)**, computed with `shap.TreeExplainer` (exact for tree ensembles) on the same held-out 2025 test set used for final evaluation. Unlike native feature importance, SHAP attributes each individual prediction to its input features in units of the target (finishing positions), with a sign — showing not just which features matter, but how and in which direction they push a given prediction.
 
@@ -333,6 +372,46 @@ Views produced, in order: global importance (mean |SHAP| bar plot), a beeswarm p
 - Best- vs. worst-prediction waterfall/force/decision plots show qualitatively different shapes — the best prediction typically has a small number of features agreeing on a confident push toward the correct position, while the worst prediction shows large, conflicting contributions, suggesting the model was working from misleading or unusually noisy inputs.
 - The heatmap is the most useful single view for spotting systematic subgroups — clusters of test rows with similar SHAP patterns often correspond to real-world groupings (e.g. a team's mid-season form spike) that aren't explicit features in the model.
 - **Caveat**: SHAP explains the model's *learned* behaviour, not ground-truth causality — a feature with high SHAP impact is only as trustworthy as the model itself, which still shows a meaningful train/test generalisation gap (see Stage 4 takeaways).
+
+### Stage 7 — Error Analysis
+
+`reports/error_analysis.ipynb` goes beyond the single headline test MAE (Stage 5, 3.34) to check whether that error is spread evenly across the 2025 held-out set or concentrated in specific, actionable slices. **Model**: the Optuna-tuned `LGBMRegressor` (`reports/lightgbm_best_params.json`), refit on the full 2019–2024 training set — the best model by test MAE in `reports/lightgbm_tuned_test_results.csv`.
+
+None of the four segmentation dimensions exist as columns in `data/test.parquet` — `Meeting.Circuit.ShortName` is label-encoded, `round_number` is standardised, there's no rookie/debut flag, and weather was never joined into `FINAL_FEATURES` (see [TODO](#todo)). Each is reconstructed from the saved preprocessors (`data/features_preprocessors.pkl`) and raw partitions before segmenting:
+
+1. **Street vs. permanent circuits** — manually classified from F1 knowledge: Baku, Jeddah, Las Vegas, Miami, Monte Carlo, Singapore, and Melbourne (a temporary street layout, not a purpose-built facility) are "street"; every other 2025 circuit is "permanent."
+2. **Rain vs. dry** — `RainRisk` (mean `Rainfall` reading per race) reconstructed directly from the raw `weather.parquet` partitions for each of the 24 2025 rounds. Two thresholds compared: any rain detected (`RainRisk > 0`, 6/24 races) vs. meaningfully wet (`RainRisk > 0.05`, 3/24 races), since the metric is heavily zero-inflated with a few marginal single-digit-percent blips.
+3. **Rookie vs. veteran** — proxy: a driver with fewer than 22 prior races (~1 season) in the full 2019–2025 ingested history is tagged "rookie."
+4. **Finishing-position tier** — podium (1–3), points (4–10), midfield (11–15), back (16–20), using the untransformed target — no reconstruction needed.
+
+Some slices are small (as few as ~60 rows) — treat magnitudes as directional, not precise.
+
+#### Results (2025 test set, n=479)
+
+| Segment | Group | n | MAE | Bias (pred − actual) |
+|---|---|---|---|---|
+| Circuit type | Permanent | 339 | 3.43 | −0.075 |
+| Circuit type | Street | 140 | 3.13 | −0.071 |
+| Rain (`>0`) | Dry | 359 | 3.37 | −0.071 |
+| Rain (`>0`) | Rain | 120 | 3.26 | −0.082 |
+| Rain (`>0.05`) | Dry | 419 | 3.29 | −0.082 |
+| Rain (`>0.05`) | Rain | 60 | 3.75 | −0.013 |
+| Experience | Rookie | 115 | 3.17 | −0.540 |
+| Experience | Veteran | 364 | 3.40 | +0.074 |
+| Position tier | Podium (1–3) | 72 | 3.17 | +3.153 |
+| Position tier | Points (4–10) | 168 | 3.05 | +2.703 |
+| Position tier | Midfield (11–15) | 120 | 1.59 | −0.379 |
+| Position tier | Back (16–20) | 119 | 5.64 | −5.637 |
+
+Full data: `reports/error_analysis_segments.csv`. Sign convention: `signed_error = pred - actual`; positive bias means the model predicted a *worse* (higher-numbered) finish than actually happened.
+
+#### Takeaways
+
+- **Position tier is the dominant error driver — far larger than any domain segment.** Textbook regression to the mean: podium finishers are under-predicted (bias ≈ +3.15) and back-of-grid finishers are massively over-predicted (bias ≈ −5.64). Back-tier MAE (≈5.6) is more than **3x** the midfield tier's MAE (≈1.6), which is itself nearly unbiased. The overall MAE of 3.34 hides this — the model is considerably more trustworthy for midfield predictions than for either extreme.
+- **Rookies get a lower MAE but a much larger, more one-sided bias than veterans.** Rookie MAE (≈3.17) is actually *below* veteran MAE (≈3.40), but rookie bias (≈−0.54) is far more negative than veteran bias (≈+0.07) — the model is systematically over-optimistic about rookies. Plausible cause: a rookie's lag/EWM form features are median-imputed or based on very few real races, so the model leans more on `GridPosition`/`TeamFinish_*`, which doesn't capture a typically rougher rookie season.
+- **Rain only hurts in genuinely wet races, not any detectable rain.** At the strict `RainRisk > 0.05` threshold, MAE is clearly worse in the rain (≈3.75 vs ≈3.29 dry). At the loose `> 0` threshold — which folds in marginal, barely-wet rounds — that gap nearly vanishes (≈3.26 vs ≈3.37). The effect is real but driven by the truly wet races, diluted by borderline ones; small sample (3–6 races), so directional rather than conclusive.
+- **Street vs. permanent circuits shows no meaningful gap** (MAE ≈3.13 street vs ≈3.43 permanent, comparable bias) — contrary to the intuition that chaotic street races (safety cars, walls, Monaco's single-file track) would be harder to predict. `GridPosition` and the team/driver form features apparently transfer just as well to street tracks in this dataset.
+- **Practical implication**: position-tier is the split to design around first — a separate correction/calibration step for the front and back of the field would likely help more than tuning for weather, circuit type, or experience.
 
 ## Adding a New Table
 
