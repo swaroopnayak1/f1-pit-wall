@@ -150,11 +150,14 @@ f1-pit-wall/
 │   │   └── weather.py            # WeatherCleaner
 │   ├── feature_engineering/
 │   │   └── feature_engineering.py  # build_features(), run_feature_engineering(), CLI
+│   ├── inference_pipeline.md        # Design doc for pre-race inference; tracks known gaps
 │   └── model/
 │       ├── baseline.ipynb          # GridPosition and DummyRegressor baselines
 │       ├── random_forest.ipynb     # RandomForestRegressor, temporal CV + test evaluation
 │       ├── lightgbm.ipynb          # LGBMRegressor, temporal CV + test evaluation, Optuna comparison
-│       └── tune_lightgbm.py        # Optuna hyperparameter search (CLI)
+│       ├── tune_lightgbm.py        # Optuna hyperparameter search (CLI)
+│       ├── inference.ipynb         # Sample inference: one race in, one prediction out
+│       └── lightgbm_model.joblib   # Persisted model (written by inference.ipynb; regenerable)
 ├── tests/
 │   ├── pipeline/
 │   │   ├── conftest.py           # Shared mock FastF1 fixtures
@@ -207,7 +210,7 @@ Reads the race-session (`session=R`) Parquet partitions, audits the data, and bu
 6. **Univariate distributions** — histograms for all numeric features to catch skew, outliers, or degenerate columns
 7. **Spearman correlation with target** — ranks all numeric features by |ρ| against `RacePosition`; `GridPosition` is the strongest pre-race signal
 8. **Feature × feature correlation heatmap** — flags pairs with |ρ| > 0.85 as potentially multicollinear
-9. **Leakage registry** — classifies every column as pre-race (safe), post-race (drop or lag), or target; weather features are kept with the caveat that telemetry is used during training and a forecast API must be substituted at inference
+9. **Leakage registry** — classifies every column as pre-race (safe), post-race (drop or lag), or target; weather features are kept with the caveat that telemetry is used during training and a forecast API must be substituted at inference. Canonical, column-by-column version: [`pipeline/feature_registry.md`](pipeline/feature_registry.md#leakage-registry)
 
 #### Feature engineering
 
@@ -232,6 +235,8 @@ Applied after feature construction, in this order:
 The fitted `LabelEncoder` instances and `StandardScaler` are persisted together to `data/features_preprocessors.pkl` so the same transforms can be reapplied at inference without re-fitting.
 
 #### Final feature set
+
+Encoding, source column, and pre-race availability for each of these lives in [`pipeline/feature_registry.md`](pipeline/feature_registry.md#locked-feature-registry-final_features) — the table below is just names and descriptions.
 
 | Feature | Description |
 |---|---|
@@ -412,6 +417,17 @@ Full data: `reports/error_analysis_segments.csv`. Sign convention: `signed_error
 - **Rain only hurts in genuinely wet races, not any detectable rain.** At the strict `RainRisk > 0.05` threshold, MAE is clearly worse in the rain (≈3.75 vs ≈3.29 dry). At the loose `> 0` threshold — which folds in marginal, barely-wet rounds — that gap nearly vanishes (≈3.26 vs ≈3.37). The effect is real but driven by the truly wet races, diluted by borderline ones; small sample (3–6 races), so directional rather than conclusive.
 - **Street vs. permanent circuits shows no meaningful gap** (MAE ≈3.13 street vs ≈3.43 permanent, comparable bias) — contrary to the intuition that chaotic street races (safety cars, walls, Monaco's single-file track) would be harder to predict. `GridPosition` and the team/driver form features apparently transfer just as well to street tracks in this dataset.
 - **Practical implication**: position-tier is the split to design around first — a separate correction/calibration step for the front and back of the field would likely help more than tuning for weather, circuit type, or experience.
+
+### Stage 8 — Sample Inference
+
+Every notebook up to this point trains and evaluates in-memory on the full historical dataset — none of them persists a model or runs a single-race prediction. `pipeline/model/inference.ipynb` closes that gap, following the assembly order laid out in [`pipeline/inference_pipeline.md`](pipeline/inference_pipeline.md): given one race's driver/team lineup and everything knowable pre-race, produce one prediction, end to end.
+
+1. **Pick the target race.** No live/upcoming-race feed or weather forecast exists yet (see [TODO](#todo)), so the demo stands in the most recently *completed* race with a full `session=R` partition on disk (skipping any newer round that only has an entry-list `session_results.parquet` with no lap data yet) for a genuinely unplayed one.
+2. **Load or train the persisted model.** If `pipeline/model/lightgbm_model.joblib` doesn't exist, fits the Optuna-tuned `LGBMRegressor` (`reports/lightgbm_best_params.json` — the same configuration `reports/error_analysis.ipynb` already treats as the best model by test MAE) on `train.parquet` and saves it there; otherwise loads it. The target race's own rows (and, for correctness, anything from the same season at or after it) are excluded from that training set first — `train.parquet`'s split only holds out year 2025, so an in-progress season would otherwise include the target race's own real result.
+3. **Assemble pre-race features.** `build_inference_features()` (`pipeline/feature_engineering/feature_engineering.py`) mirrors `build_features()`'s join and lag/rolling computation but is transform-only: it masks the target race's own `RacePosition` to NaN before computing lag/EWM features, keeps the target race's rows instead of dropping them for a NaN target, and applies the saved `LabelEncoder`/`StandardScaler` from `data/features_preprocessors.pkl` with `.transform` (never refit).
+4. **Predict and report.** Scores every driver in the field, ranks them by predicted position, and calls out the single top prediction (the predicted race winner) as the headline result. Because the demo target is a historical race, the real result can be unmasked afterward as a sanity check (not a model evaluation — n=1).
+
+**Known limitation surfaced by this notebook, not just the design doc**: imputation medians for lag/rolling features aren't persisted alongside the label encoders/scaler, so a driver with no usable prior-race history (a debut, or a DNF-on-lap-1 with no lap time to compute `LapStd_lag1` from) can't be transformed strictly. `build_inference_features(..., strict=False)` prints a warning and leaves that cell NaN instead of raising or silently imputing — LightGBM splits on NaN natively, so it doesn't block a prediction for that driver.
 
 ## Adding a New Table
 

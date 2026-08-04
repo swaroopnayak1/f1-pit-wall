@@ -6,3 +6,4 @@ __pycache__/
 data/
 .claude/
 .pytest_cache/
+pipeline/model/*.joblib

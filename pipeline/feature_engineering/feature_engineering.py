@@ -130,7 +130,14 @@ def _load_sources(
             + ". Run the ingestion pipeline first."
         )
 
+    required = ["session_info.parquet", "driver_info.parquet", "session_results.parquet", "laps.parquet"]
     for sd in session_dirs:
+        missing = [f for f in required if not (sd / f).exists()]
+        if missing:
+            # e.g. a future round with only an entry-list session_results.parquet
+            # (no driver_info/laps/weather yet) — skip rather than abort the build.
+            print(f"[features] skipping incomplete partition {sd} (missing {missing})")
+            continue
         all_si.append(pq.ParquetFile(sd / "session_info.parquet").read().to_pandas())
         all_di.append(pq.ParquetFile(sd / "driver_info.parquet").read().to_pandas())
         all_sr.append(pq.ParquetFile(sd / "session_results.parquet").read().to_pandas())
@@ -330,6 +337,110 @@ def build_features(
     df = _impute_nulls(df)
     df, scaler = _scale_features(df)
     return df, {"label_encoders": label_encoders, "scaler": scaler}
+
+
+def load_preprocessors(preprocessors_path: str | Path = DEFAULT_PREPROCESSORS) -> dict:
+    """Load the label encoders + scaler pickled by :func:`run_feature_engineering`."""
+    with open(preprocessors_path, "rb") as fh:
+        return pickle.load(fh)
+
+
+def build_inference_features(
+    target_year: int,
+    target_round: int,
+    data_root: str | Path = DEFAULT_DATA_ROOT,
+    *,
+    preprocessors: dict | None = None,
+    preprocessors_path: str | Path = DEFAULT_PREPROCESSORS,
+    ewm_span: int = 5,
+    roll_window: int = 3,
+    strict: bool = True,
+) -> pd.DataFrame:
+    """
+    Assemble FINAL_FEATURES for every driver in one race not used for fitting.
+
+    Unlike :func:`build_features`, this is transform-only and safe to call on a
+    race whose target is unknown (see ``pipeline/inference_pipeline.md``):
+
+    - the target race's own ``RacePosition`` is masked to NaN before lag/rolling
+      features are computed, so a real historical race can stand in for an
+      unplayed one without its own result leaking into its row (shift(1)
+      already prevents this, but masking keeps the "unknown outcome" framing
+      honest for demo purposes)
+    - the target race's rows are kept even though ``RacePosition`` is NaN
+      (``build_features`` drops these; here that row *is* the prediction target)
+    - categoricals/numerics are transformed with the already-fitted
+      LabelEncoder/StandardScaler from ``preprocessors_path``, never refit
+
+    Returns id columns + FINAL_FEATURES for (target_year, target_round) only,
+    one row per driver. A driver can have a NaN feature the saved preprocessors
+    have no fitted median for (e.g. a debut, or a DNF-on-lap-1 leaving no lap
+    time to compute `LapStd_lag1` from) — imputation medians aren't persisted
+    alongside the encoders/scaler today, so those cases can't be transformed.
+    When ``strict`` (default), this raises so the gap can't pass silently;
+    set ``strict=False`` to instead print a warning and leave the affected
+    cell(s) NaN (fine for a LightGBM model, which handles NaN natively, but
+    unsuitable for the scaler-fitted numeric range other models may expect).
+    Unseen team/circuit labels always raise regardless of ``strict``.
+    """
+    data_root = Path(data_root)
+    if preprocessors is None:
+        preprocessors = load_preprocessors(preprocessors_path)
+
+    # Only load seasons up to the target race: history from later seasons can't
+    # exist for a genuine pre-race call, and it also sidesteps partial/placeholder
+    # partitions a future season's calendar entry may have on disk (e.g. an
+    # entry-list-only session with no driver_info/laps/weather files yet).
+    available_years = sorted(
+        int(p.name.split("=")[1]) for p in Path(data_root).glob("year=*")
+    )
+    load_years = [y for y in available_years if y <= target_year]
+
+    session_info, driver_info, session_results, laps_raw = _load_sources(data_root, load_years)
+    laps_agg = _aggregate_laps(laps_raw)
+    df = _build_race_frame(session_info, driver_info, session_results, laps_agg)
+    df = _normalise_teams(df)
+
+    target_mask = (df["year"] == target_year) & (df["round_number"] == target_round)
+    if not target_mask.any():
+        raise ValueError(f"No race data found for year={target_year}, round_number={target_round}")
+    df.loc[target_mask, "RacePosition"] = float("nan")
+
+    df = _add_lag_features(df, ewm_span=ewm_span, roll_window=roll_window)
+    # _add_lag_features sorts and resets the index, so the mask must be
+    # recomputed against the returned frame rather than reused positionally.
+    target_mask = (df["year"] == target_year) & (df["round_number"] == target_round)
+
+    id_cols = ["year", "round_number", "DriverId", "DriverNumber"]
+    keep = list(dict.fromkeys(id_cols + FINAL_FEATURES))
+    out = df.loc[target_mask, [c for c in keep if c in df.columns]].reset_index(drop=True)
+
+    label_encoders = preprocessors["label_encoders"]
+    for col in CATEGORICAL_FEATURES:
+        le = label_encoders[col]
+        str_col = out[col].astype(str)
+        unseen = ~str_col.isin(le.classes_)
+        if unseen.any():
+            raise ValueError(
+                f"{col} has value(s) unseen during training: {str_col[unseen].unique().tolist()}"
+            )
+        out[col] = le.transform(str_col)
+
+    n_missing = out[NUMERIC_SCALE_FEATURES].isna().sum()
+    if n_missing.any():
+        rows_with_nan = out.loc[out[NUMERIC_SCALE_FEATURES].isna().any(axis=1), "DriverId"].tolist()
+        message = (
+            "Inference row(s) have NaN feature(s) with no persisted training median to impute "
+            f"with (e.g. a debut driver/team, or a DNF-on-lap-1 with no lap time to compute "
+            f"LapStd_lag1 from): {n_missing[n_missing > 0].to_dict()} - affected drivers: {rows_with_nan}"
+        )
+        if strict:
+            raise ValueError(message)
+        print(f"[inference] WARNING: {message}")
+
+    scaler = preprocessors["scaler"]
+    out[NUMERIC_SCALE_FEATURES] = scaler.transform(out[NUMERIC_SCALE_FEATURES])
+    return out
 
 
 def run_feature_engineering(
